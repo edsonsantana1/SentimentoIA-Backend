@@ -30,3 +30,6 @@ lxml
 mongomock
 pydantic-settings
 playwright>=1.40.0
+httpx
+requests
+python-jose[cryptography]
