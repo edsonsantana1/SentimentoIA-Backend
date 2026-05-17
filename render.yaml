@@ -1,0 +1,42 @@
+services:
+  - type: web
+    name: sentimentoia-api
+    runtime: python
+    rootDir: apps/api
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ENV
+        value: production
+      - key: DEBUG
+        value: false,
+      - key: SCRAPER_ENABLE_BROWSER_FALLBACK
+        value: false,
+      - key: SCRAPER_DEFAULT_SOURCES
+        value: reclameaqui,reddit,web
+      - key: SCRAPER_RELEVANCE_THRESHOLD
+        value: "0.1"
+      - key: SCRAPER_DEFAULT_LIMIT
+        value: "10"
+      - key: SCRAPER_MAX_ITEMS_PER_SOURCE
+        value: "25"
+      - key: SCRAPER_MAX_TOTAL_ITEMS
+        value: "75"
+      - key: LLM_TRIGGER_MIN_COMMENTS
+        value: "1"
+      - key: MONGODB_URI
+        sync: false
+      - key: DATABASE_NAME
+        value: sentimento_db
+      - key: SECRET_KEY
+        generateValue: true
+      - key: OLLAMA_API_KEY
+        sync: false
+      - key: OLLAMA_BASE_URL
+        value: https://ollama.com/api
+      - key: OLLAMA_MODEL
+        value: gpt-oss:20b-cloud
+      - key: FRONTEND_URL
+        sync: false
+      - key: CORS_ORIGINS_CSV
+        sync: false

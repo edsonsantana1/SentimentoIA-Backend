@@ -36,11 +36,12 @@ class SearchService:
     ) -> dict[str, Any]:
         db = get_db()
         now = utcnow()
+        clean_query = (query or "").strip()
 
         # Cache inteligente: se busca igual existir dentro do TTL, retorna o resultado salvo.
         cache_key = {
             "user_id": user_id,
-            "query": query.strip().lower(),
+            "query": clean_query.lower(),
             "sources": sorted([s.lower() for s in sources]),
             "period_days": int(period_days),
             "locality": locality or "",
@@ -57,7 +58,18 @@ class SearchService:
                 sort=[("created_at", -1)],
             )
             if cached:
-                mentions = list(db.mentions.find({"search_id": cached["search_id"]}, {"raw": 0}).sort("published_at", -1))
+                mentions = list(
+                    db.mentions.find(
+                        {"user_id": user_id, "search_id": cached["search_id"]},
+                        {"raw": 0},
+                    ).sort("published_at", -1)
+                )
+                status = cached.get("result_status") or ("completed" if mentions else "no_results")
+                message = cached.get("message") or (
+                    "Busca recuperada do cache."
+                    if mentions
+                    else "Não encontramos menções públicas suficientes para essa busca nas fontes consultadas."
+                )
                 return {
                     "search_id": cached["search_id"],
                     "query": query,
@@ -67,6 +79,9 @@ class SearchService:
                     "metrics": cached.get("metrics", {}),
                     "llm_analysis": cached.get("llm_analysis", {}),
                     "errors": cached.get("errors", []),
+                    "status": status,
+                    "message": message,
+                    "suggestions": cached.get("suggestions", []),
                 }
 
         search_id = make_search_id()
@@ -75,13 +90,14 @@ class SearchService:
             "search_id": search_id,
             **cache_key,
             "status": "running",
+            "result_status": "running",
             "created_at": now,
             "updated_at": now,
             "errors": [],
         })
 
         collected, errors = await CollectorService.collect(
-            query,
+            clean_query,
             sources,
             period_days=period_days,
             locality=locality,
@@ -90,8 +106,13 @@ class SearchService:
         collected = SearchService._dedupe_mentions_in_memory(collected)
 
         enriched_mentions: list[dict[str, Any]] = []
+        cached_mentions_for_this_search: list[dict[str, Any]] = []
         cutoff = now - timedelta(days=max(1, int(period_days)))
-        existing_signatures = SearchService._load_existing_signatures(db=db, user_id=user_id, mentions=collected)
+        existing_signatures = SearchService._load_existing_signatures(
+            db=db,
+            user_id=user_id,
+            mentions=collected,
+        )
 
         for mention in collected:
             published_at = mention.get("published_at")
@@ -104,6 +125,23 @@ class SearchService:
 
             signature = SearchService._mention_signature(mention)
             if SearchService._signature_exists(signature, existing_signatures):
+                existing_mention = SearchService._find_existing_mention_by_signature(
+                    db=db,
+                    user_id=user_id,
+                    signature=signature,
+                )
+                if existing_mention:
+                    # Clona a menção para o search_id atual. Isso mantém isolamento
+                    # por busca e evita dashboard vazio em buscas repetidas.
+                    existing_mention.pop("_id", None)
+                    existing_mention.update({
+                        "search_id": search_id,
+                        "user_id": user_id,
+                        "query": clean_query,
+                        "cached": True,
+                        "created_at": utcnow(),
+                    })
+                    cached_mentions_for_this_search.append(existing_mention)
                 continue
 
             enrichment = EnrichmentService.analyze_mention(mention["text"], mention.get("rating"))
@@ -112,14 +150,16 @@ class SearchService:
             mention.update({
                 "search_id": search_id,
                 "user_id": user_id,
-                "query": query,
+                "query": clean_query,
+                "cached": False,
                 "mention_rank_score": mention_rank_score,
                 "created_at": utcnow(),
             })
             enriched_mentions.append(mention)
             SearchService._remember_signature(signature, existing_signatures)
 
-        enriched_mentions.sort(
+        response_mentions = enriched_mentions + cached_mentions_for_this_search
+        response_mentions.sort(
             key=lambda item: (
                 float(item.get("mention_rank_score") or 0),
                 str(item.get("published_at") or ""),
@@ -130,37 +170,112 @@ class SearchService:
         if enriched_mentions:
             db.mentions.insert_many(enriched_mentions)
 
-        metrics = EnrichmentService.aggregate(enriched_mentions)
-        llm_analysis = await LLMService.analyze_mentions(query, enriched_mentions)
+        if cached_mentions_for_this_search:
+            try:
+                db.mentions.insert_many(cached_mentions_for_this_search, ordered=False)
+            except Exception as exc:
+                logger.warning("Falha ao clonar menções cached para search_id=%s: %s", search_id, exc)
 
-        alerts = SearchService.generate_alerts(user_id, search_id, query, enriched_mentions, metrics, llm_analysis)
+        if not response_mentions:
+            metrics = EnrichmentService.aggregate([])
+            suggestions = [
+                "Tente buscar apenas pelo nome principal da empresa.",
+                "Evite termos muito longos na primeira busca.",
+                "Teste variações como marca + reclamação, marca + atendimento ou marca + produto.",
+                "Algumas fontes públicas podem bloquear scraping, retornar captcha ou não possuir dados disponíveis.",
+            ]
+            llm_analysis = {
+                "summary": "Não encontramos menções públicas suficientes para gerar uma análise confiável nas fontes consultadas.",
+                "risks": [],
+                "opportunities": [],
+                "recommendations": suggestions[:3],
+                "confidence": "insuficiente",
+                "status": "no_results",
+            }
+
+            db.search_jobs.update_one(
+                {"search_id": search_id},
+                {
+                    "$set": {
+                        "status": "completed",
+                        "result_status": "no_results",
+                        "updated_at": utcnow(),
+                        "total": 0,
+                        "metrics": metrics,
+                        "llm_analysis": llm_analysis,
+                        "errors": errors,
+                        "message": llm_analysis["summary"],
+                        "suggestions": suggestions,
+                    }
+                },
+            )
+
+            return {
+                "search_id": search_id,
+                "query": clean_query,
+                "cached": False,
+                "total": 0,
+                "mentions": [],
+                "metrics": metrics,
+                "llm_analysis": llm_analysis,
+                "alerts": [],
+                "errors": errors,
+                "status": "no_results",
+                "message": llm_analysis["summary"],
+                "suggestions": suggestions,
+            }
+
+        metrics = EnrichmentService.aggregate(response_mentions)
+        llm_analysis = await LLMService.analyze_mentions(clean_query, response_mentions)
+
+        alerts = SearchService.generate_alerts(
+            user_id,
+            search_id,
+            clean_query,
+            response_mentions,
+            metrics,
+            llm_analysis,
+        )
         if alerts:
             db.alerts.insert_many(alerts)
+
+        result_status = "completed" if len(response_mentions) >= int(settings.LLM_TRIGGER_MIN_COMMENTS) else "partial"
+        message = (
+            "Busca concluída com menções suficientes para análise."
+            if result_status == "completed"
+            else "Busca concluída com poucas menções. A análise é preliminar e tem baixa confiança."
+        )
 
         db.search_jobs.update_one(
             {"search_id": search_id},
             {
                 "$set": {
                     "status": "completed",
+                    "result_status": result_status,
                     "updated_at": utcnow(),
-                    "total": len(enriched_mentions),
+                    "total": len(response_mentions),
                     "metrics": metrics,
                     "llm_analysis": llm_analysis,
                     "errors": errors,
+                    "message": message,
+                    "suggestions": [],
                 }
             },
         )
 
         return {
             "search_id": search_id,
-            "query": query,
+            "query": clean_query,
             "cached": False,
-            "total": len(enriched_mentions),
-            "mentions": SearchService.serialize_many(enriched_mentions),
+            "total": len(response_mentions),
+            "mentions": SearchService.serialize_many(response_mentions),
             "metrics": metrics,
             "llm_analysis": llm_analysis,
             "alerts": SearchService.serialize_many(alerts),
             "errors": errors,
+            "status": result_status,
+            "message": message,
+            "suggestions": [],
         }
 
     @staticmethod

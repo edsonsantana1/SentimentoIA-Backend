@@ -110,10 +110,10 @@ class Settings(BaseSettings):
     )
     SCRAPER_DELAY_SECONDS: float = 1.0
     SCRAPER_TIMEOUT_SECONDS: int = 20
-    SCRAPER_DEFAULT_LIMIT: int = 5
+    SCRAPER_DEFAULT_LIMIT: int = 10
     SCRAPER_DEFAULT_SOURCES: str = "reclameaqui,reddit,web"
-    SCRAPER_MAX_ITEMS_PER_SOURCE: int = 10
-    SCRAPER_MAX_TOTAL_ITEMS: int = 50
+    SCRAPER_MAX_ITEMS_PER_SOURCE: int = 25
+    SCRAPER_MAX_TOTAL_ITEMS: int = 75
     SCRAPER_MAX_PAGES_PER_SOURCE: int = 2
     SCRAPER_RETRY_ATTEMPTS: int = 3
     SCRAPER_RETRY_BACKOFF_SECONDS: float = 1.0
@@ -125,6 +125,8 @@ class Settings(BaseSettings):
     SCRAPER_MASTODON_SEARCH_PATH: str = "/api/v2/search"
     SCRAPER_MASTODON_ACCESS_TOKEN: str = ""
     SCRAPER_WEB_SEARCH_URL: str = "https://duckduckgo.com/html/"
+    SCRAPER_RELEVANCE_THRESHOLD: float = 0.1
+    SCRAPER_ENABLE_BROWSER_FALLBACK: bool = False
 
     # Cache e atualização automática
     CACHE_TTL_MINUTES: int = 30
@@ -204,7 +206,7 @@ class Settings(BaseSettings):
     BATCH_SIZE: int = 100
     WORKER_POLL_INTERVAL_SECONDS: int = 5
     WORKER_BATCH_SIZE: int = 50
-    LLM_TRIGGER_MIN_COMMENTS: int = 5
+    LLM_TRIGGER_MIN_COMMENTS: int = 1
     LLM_MAX_SAMPLE_MENTIONS: int = 40
     LOG_LEVEL: str = "INFO"
 

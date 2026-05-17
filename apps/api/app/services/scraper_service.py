@@ -81,7 +81,7 @@ class ScraperService:
         user_settings = InsightService.get_user_settings(
             user_id=user_id) if user_id else {}
         relevance_threshold = float(user_settings.get(
-            'scraper_relevance_threshold', getattr(settings, 'SCRAPER_RELEVANCE_THRESHOLD', 0.5)))
+            'scraper_relevance_threshold', getattr(settings, 'SCRAPER_RELEVANCE_THRESHOLD', 0.1)))
         term = (query or "").strip()
         if not term:
             raise ValueError("Termo de busca obrigatorio")
@@ -417,14 +417,15 @@ class ScraperService:
             if web_items:
                 return web_items, None
 
-            browser_items = ScraperService._scrape_reclameaqui_browser_fallback(
-                query=query,
-                limit=limit,
-                base_url=base_url,
-                seen_urls=seen_urls,
-            )
-            if browser_items:
-                return browser_items, None
+            if bool(getattr(settings, "SCRAPER_ENABLE_BROWSER_FALLBACK", False)):
+                browser_items = ScraperService._scrape_reclameaqui_browser_fallback(
+                    query=query,
+                    limit=limit,
+                    base_url=base_url,
+                    seen_urls=seen_urls,
+                )
+                if browser_items:
+                    return browser_items, None
 
             return [], "Reclame Aqui sem resultados"
         return items, None
@@ -719,8 +720,17 @@ class ScraperService:
         base_url: str,
         seen_urls: set[str],
     ) -> list[dict[str, Any]]:
-        """Fallback opcional com browser headless quando HTML estatico nao retorna resultados."""
-        # Reforçar política asyncio ANTES de tentar usar Playwright no Windows
+        """Fallback opcional com browser headless.
+
+        Em produção/Render, este fallback fica desligado por padrão.
+        Playwright é pesado e pode falhar por event loop/subprocess em Windows
+        ou por dependências de sistema em containers. O scraper não deve depender
+        dele para responder ao usuário.
+        """
+        if not bool(getattr(settings, "SCRAPER_ENABLE_BROWSER_FALLBACK", False)):
+            return []
+
+        # Reforçar política asyncio ANTES de tentar usar Playwright no Windows.
         ScraperService._ensure_windows_asyncio_policy()
 
         try:
