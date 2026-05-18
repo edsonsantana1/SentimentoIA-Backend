@@ -5,11 +5,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """Configurações centrais do backend.
 
-    Manutenção:
-    - Nunca coloque chaves reais aqui.
-        - Use sempre o arquivo apps/api/.env.
-        - O Apify foi removido do fluxo principal.
-        - Coleta de fontes externas agora usa scraping com BeautifulSoup.
+    Regras:
+    - Nunca coloque chaves reais neste arquivo.
+    - Chaves e senhas devem ficar no .env local ou nas variáveis do Render.
+    - O backend usa Ollama Cloud, MongoDB Atlas e scraping controlado.
     """
 
     ENV: str = "development"
@@ -26,22 +25,21 @@ class Settings(BaseSettings):
     MONGODB_URI: str = "mongodb://localhost:27017"
     DATABASE_NAME: str = "sentimento_db"
 
-    # LLM oficial do MVP: Ollama Cloud.
+    # LLM oficial do MVP: Ollama Cloud
     LLM_PROVIDER: str = "ollama"
     OLLAMA_BASE_URL: str = "https://ollama.com/api"
-    # Legado: mantido para compatibilidade com ambientes antigos.
     OLLAMA_CLOUD_URL: str = ""
     OLLAMA_API_KEY: str = ""
-    OLLAMA_MODEL: str = "llama3.1:8b"
+    OLLAMA_MODEL: str = "gpt-oss:20b-cloud"
     OLLAMA_TIMEOUT_SECONDS: int = 60
 
-    # URL publica do frontend para links transacionais.
+    # URL pública do frontend
     FRONTEND_URL: str = "http://localhost:5173"
 
-    # Recuperacao de senha.
+    # Recuperação de senha
     PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: int = 30
 
-    # SMTP (provedor gratuito suportado via credenciais do usuario).
+    # SMTP
     SMTP_HOST: str = ""
     SMTP_PORT: int = 587
     SMTP_USER: str = ""
@@ -61,7 +59,7 @@ class Settings(BaseSettings):
     def SMTP_EFFECTIVE_FROM_EMAIL(self) -> str:
         return (self.SMTP_FROM or self.SMTP_FROM_EMAIL or "").strip()
 
-    # Legado: mantido apenas para não quebrar ambientes antigos.
+    # Legado: mantido apenas para não quebrar ambientes antigos
     OPENROUTER_API_KEY: str = ""
     OPENROUTER_API_URL: str = "https://openrouter.ai/api/v1"
     OPENROUTER_MODEL: str = "openrouter/free"
@@ -87,50 +85,75 @@ class Settings(BaseSettings):
 
     @property
     def OLLAMA_EFFECTIVE_URL(self) -> str:
-        """Retorna base URL normalizada, sem trailing /api para evitar duplicacao.
+        """Retorna base URL normalizada, sem trailing /api.
 
-        Se o usuario configurar OLLAMA_BASE_URL=https://ollama.com/api,
-        esta property retorna https://ollama.com para que o servico monte
-        /api/generate corretamente.
+        Exemplo:
+        OLLAMA_BASE_URL=https://ollama.com/api
+        retorna:
+        https://ollama.com
         """
         configured_url = (
-            self.OLLAMA_BASE_URL or self.OLLAMA_CLOUD_URL or "").strip().rstrip("/")
+            self.OLLAMA_BASE_URL or self.OLLAMA_CLOUD_URL or ""
+        ).strip().rstrip("/")
+
         normalized = configured_url.lower()
+
         if "localhost" in normalized or "127.0.0.1" in normalized:
             return ""
-        # Remove trailing /api para evitar /api/api/generate
+
         if normalized.endswith("/api"):
             configured_url = configured_url[:-4]
+
         return configured_url
 
-    # Scraping (POC/MVP)
+    # Scraping
     SCRAPER_USER_AGENT: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
     )
-    SCRAPER_DELAY_SECONDS: float = 1.0
-    SCRAPER_TIMEOUT_SECONDS: int = 12
-    SCRAPER_DEFAULT_LIMIT: int = 8
+
+    # Limites gerais de scraping.
+    # Valores pensados para Render: mais estabilidade, menos timeout.
     SCRAPER_DEFAULT_SOURCES: str = "reclameaqui,reddit,web"
-    SCRAPER_MAX_ITEMS_PER_SOURCE: int = 10
-    SCRAPER_MAX_TOTAL_ITEMS: int = 24
+    SCRAPER_DEFAULT_LIMIT: int = 6
+    SCRAPER_MAX_ITEMS_PER_SOURCE: int = 8
+    SCRAPER_MAX_TOTAL_ITEMS: int = 18
     SCRAPER_MAX_PAGES_PER_SOURCE: int = 2
+    SCRAPER_MAX_WORKERS: int = 1
+
+    SCRAPER_MIN_TEXT_LENGTH: int = 8
+    SCRAPER_RELEVANCE_THRESHOLD: float = 0.0
+    SCRAPER_MIN_QUALITY_SCORE: float = 0.08
+
+    SCRAPER_DELAY_SECONDS: float = 1.0
+    SCRAPER_TIMEOUT_SECONDS: int = 8
     SCRAPER_RETRY_ATTEMPTS: int = 1
     SCRAPER_RETRY_BACKOFF_SECONDS: float = 1.0
-    SCRAPER_MIN_TEXT_LENGTH: int = 8
+
+    SCRAPER_ENABLE_BROWSER_FALLBACK: bool = False
+
+    # ReclameAqui
     SCRAPER_RECLAMEAQUI_URL: str = "https://www.reclameaqui.com.br"
     SCRAPER_RECLAMEAQUI_SEARCH_URL: str = "https://www.reclameaqui.com.br/busca/?q="
+
+    # Reddit
     SCRAPER_REDDIT_URL: str = "https://www.reddit.com"
+    SCRAPER_REDDIT_SUBREDDITS: str = "brasil,brdev,InternetBrasil,conselhoslegais,consumidor,all"
+    SCRAPER_REDDIT_TIME_FILTER: str = "year"
+
+    # Web aberta.
+    # O DuckDuckGo HTML pode falhar no Render. Por isso usamos timeout curto
+    # e poucas queries por busca.
+    SCRAPER_WEB_ENABLED: bool = True
+    SCRAPER_WEB_SEARCH_URL: str = "https://html.duckduckgo.com/html/"
+    SCRAPER_DDG_TIMEOUT_SECONDS: int = 4
+    SCRAPER_DDG_MAX_QUERIES: int = 2
+
+    # Mastodon legado/opcional
     SCRAPER_MASTODON_BASE_URL: str = "https://mastodon.social"
     SCRAPER_MASTODON_SEARCH_PATH: str = "/api/v2/search"
     SCRAPER_MASTODON_ACCESS_TOKEN: str = ""
-    SCRAPER_WEB_SEARCH_URL: str = "https://duckduckgo.com/html/"
-    SCRAPER_RELEVANCE_THRESHOLD: float = 0.0
-    SCRAPER_MIN_QUALITY_SCORE: float = 0.10
-    SCRAPER_MAX_WORKERS: int = 1
-    SCRAPER_REDDIT_SUBREDDITS: str = "brasil,brdev,InternetBrasil,conselhoslegais,consumidor,all"
-    SCRAPER_REDDIT_TIME_FILTER: str = "year"
-    SCRAPER_ENABLE_BROWSER_FALLBACK: bool = False
 
     # Cache e atualização automática
     CACHE_TTL_MINUTES: int = 30
@@ -146,7 +169,7 @@ class Settings(BaseSettings):
     ENABLE_DEV_CLEAR_DATA: bool = False
     PUBLIC_ERROR_VERBOSE: bool = False
 
-    # CORS local
+    # CORS
     CORS_ORIGINS_CSV: str = ""
     CORS_ORIGINS: list = [
         "http://localhost:3000",
@@ -159,7 +182,11 @@ class Settings(BaseSettings):
 
     @property
     def IS_PRODUCTION(self) -> bool:
-        return (self.ENV or "").strip().lower() in {"production", "prod", "release"}
+        return (self.ENV or "").strip().lower() in {
+            "production",
+            "prod",
+            "release",
+        }
 
     @staticmethod
     def _normalize_origin(origin: str) -> str:
@@ -172,20 +199,23 @@ class Settings(BaseSettings):
 
     @property
     def CORS_ORIGINS_EFFECTIVE(self) -> list[str]:
-        """Resolve origens CORS de forma segura para deploy.
+        """Resolve origens CORS de forma segura.
 
         Regras:
-        - Sempre considera FRONTEND_URL quando valido.
-        - Aceita override por CORS_ORIGINS_CSV (separado por virgula).
-        - Em producao, remove localhost/127.0.0.1 automaticamente.
+        - Sempre considera FRONTEND_URL quando válido.
+        - Aceita override por CORS_ORIGINS_CSV separado por vírgula.
+        - Em produção, remove localhost/127.0.0.1 automaticamente.
         """
         candidates: list[str] = []
 
         if isinstance(self.CORS_ORIGINS, list):
             candidates.extend(str(item) for item in self.CORS_ORIGINS)
 
-        csv_origins = [item.strip() for item in str(
-            self.CORS_ORIGINS_CSV or "").split(",") if item.strip()]
+        csv_origins = [
+            item.strip()
+            for item in str(self.CORS_ORIGINS_CSV or "").split(",")
+            if item.strip()
+        ]
         candidates.extend(csv_origins)
 
         if self.FRONTEND_URL:
@@ -193,13 +223,19 @@ class Settings(BaseSettings):
 
         deduped: list[str] = []
         seen: set[str] = set()
+
         for item in candidates:
             normalized = self._normalize_origin(item)
             if not normalized:
                 continue
+
             lowered = normalized.lower()
-            if self.IS_PRODUCTION and ("localhost" in lowered or "127.0.0.1" in lowered):
+
+            if self.IS_PRODUCTION and (
+                "localhost" in lowered or "127.0.0.1" in lowered
+            ):
                 continue
+
             if normalized not in seen:
                 seen.add(normalized)
                 deduped.append(normalized)
