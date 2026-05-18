@@ -109,15 +109,15 @@ class Settings(BaseSettings):
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
     SCRAPER_DELAY_SECONDS: float = 1.0
-    SCRAPER_TIMEOUT_SECONDS: int = 20
-    SCRAPER_DEFAULT_LIMIT: int = 10
+    SCRAPER_TIMEOUT_SECONDS: int = 12
+    SCRAPER_DEFAULT_LIMIT: int = 8
     SCRAPER_DEFAULT_SOURCES: str = "reclameaqui,reddit,web"
-    SCRAPER_MAX_ITEMS_PER_SOURCE: int = 25
-    SCRAPER_MAX_TOTAL_ITEMS: int = 75
+    SCRAPER_MAX_ITEMS_PER_SOURCE: int = 10
+    SCRAPER_MAX_TOTAL_ITEMS: int = 24
     SCRAPER_MAX_PAGES_PER_SOURCE: int = 2
-    SCRAPER_RETRY_ATTEMPTS: int = 3
+    SCRAPER_RETRY_ATTEMPTS: int = 1
     SCRAPER_RETRY_BACKOFF_SECONDS: float = 1.0
-    SCRAPER_MIN_TEXT_LENGTH: int = 20
+    SCRAPER_MIN_TEXT_LENGTH: int = 8
     SCRAPER_RECLAMEAQUI_URL: str = "https://www.reclameaqui.com.br"
     SCRAPER_RECLAMEAQUI_SEARCH_URL: str = "https://www.reclameaqui.com.br/busca/?q="
     SCRAPER_REDDIT_URL: str = "https://www.reddit.com"
@@ -125,13 +125,18 @@ class Settings(BaseSettings):
     SCRAPER_MASTODON_SEARCH_PATH: str = "/api/v2/search"
     SCRAPER_MASTODON_ACCESS_TOKEN: str = ""
     SCRAPER_WEB_SEARCH_URL: str = "https://duckduckgo.com/html/"
-    SCRAPER_RELEVANCE_THRESHOLD: float = 0.1
+    SCRAPER_RELEVANCE_THRESHOLD: float = 0.0
+    SCRAPER_MIN_QUALITY_SCORE: float = 0.10
+    SCRAPER_MAX_WORKERS: int = 1
+    SCRAPER_REDDIT_SUBREDDITS: str = "brasil,brdev,InternetBrasil,conselhoslegais,consumidor,all"
+    SCRAPER_REDDIT_TIME_FILTER: str = "year"
     SCRAPER_ENABLE_BROWSER_FALLBACK: bool = False
 
     # Cache e atualização automática
     CACHE_TTL_MINUTES: int = 30
     AUTO_REFRESH_ENABLED: bool = False
     AUTO_REFRESH_INTERVAL_MINUTES: int = 60
+    SEARCH_TIMEOUT_SECONDS: int = 55
 
     # Segurança
     SECRET_KEY: str = "change-me-in-production"

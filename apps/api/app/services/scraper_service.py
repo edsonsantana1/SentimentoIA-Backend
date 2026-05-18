@@ -55,6 +55,28 @@ class ScraperService:
         "samsung": "samsung",
         "sony": "sony",
         "lg": "lg-eletronicos",
+        "claro": "claro",
+        "claro brasil": "claro",
+        "tim": "tim-celular",
+        "tim brasil": "tim-celular",
+        "dell": "dell-computadores",
+        "dell brasil": "dell-computadores",
+        "lenovo": "lenovo-tecnologia-brasil",
+        "lenovo brasil": "lenovo-tecnologia-brasil",
+        "kabum": "kabum",
+        "ka bu m": "kabum",
+        "ifood": "ifood",
+        "i food": "ifood",
+        "amazon": "amazon",
+        "amazon brasil": "amazon",
+        "shopee": "shopee",
+        "magazine luiza": "magazine-luiza-loja-online",
+        "magalu": "magazine-luiza-loja-online",
+        "americanas": "americanas-com-loja-online",
+        "netshoes": "netshoes",
+        "casas bahia": "casas-bahia-loja-online",
+        "ponto frio": "ponto-frio-loja-online",
+        "extra": "extra-loja-online",
     }
 
     @staticmethod
@@ -205,13 +227,38 @@ class ScraperService:
 
     @staticmethod
     def _build_reddit_queries(query: str) -> list[str]:
-        """Gera variações de consulta para melhorar relevância no Reddit."""
-        q = query.strip()
-        queries = [f'"{q}"']
-        if len(q.split()) <= 3:
-            queries.append(f'"{q}" brasil')
-            queries.append(f'"{q}" reclamação OR problema OR experiência')
-        return queries
+        """Gera variações de consulta para melhorar cobertura no Reddit.
+
+        Reddit não responde tão bem a operadores complexos em português.
+        Por isso usamos várias consultas simples, com dedupe posterior.
+        """
+        q = ScraperService._clean_text(query.strip())
+        if not q:
+            return []
+
+        variants = [
+            q,
+            f'"{q}"',
+            f'{q} brasil',
+            f'{q} reclamação',
+            f'{q} problema',
+            f'{q} atendimento',
+            f'{q} suporte',
+            f'{q} cobrança',
+            f'{q} reembolso',
+            f'{q} experiência',
+            f'{q} opinião',
+        ]
+
+        # Remove duplicados preservando ordem.
+        output: list[str] = []
+        seen: set[str] = set()
+        for item in variants:
+            key = item.lower().strip()
+            if key and key not in seen:
+                seen.add(key)
+                output.append(item)
+        return output
 
     @staticmethod
     def _relevance_check(query: str, title: str, snippet: str) -> float:
@@ -236,70 +283,118 @@ class ScraperService:
 
     @staticmethod
     def _scrape_reddit(query: str, limit: int) -> tuple[list[dict[str, Any]], str | None]:
-        request_limit = max(limit * 4, limit)
-        subreddits = ["brasil", "brdev",
-                      "consumidor", "explainlikeimfive", "all"]
+        """Busca Reddit público sem autenticação.
+
+        Objetivo: complementar ReclameAqui e Web, não substituir.
+        Limite operacional: Reddit pode retornar pouco para marcas brasileiras,
+        então usamos variações de query + subreddits relevantes + dedupe.
+        """
+        request_limit = max(limit * 3, 10)
+
+        subreddits_csv = str(getattr(
+            settings,
+            "SCRAPER_REDDIT_SUBREDDITS",
+            "brasil,brdev,InternetBrasil,conselhoslegais,consumidor,all",
+        ))
+        subreddits = [s.strip().strip("/") for s in subreddits_csv.split(",") if s.strip()]
+        if not subreddits:
+            subreddits = ["brasil", "brdev", "consumidor", "all"]
+
+        search_queries = ScraperService._build_reddit_queries(query)
+        time_filter = str(getattr(settings, "SCRAPER_REDDIT_TIME_FILTER", "year") or "year")
+
         all_items: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
+        errors: list[str] = []
 
-        for sub in subreddits:
-            endpoint = f"{settings.SCRAPER_REDDIT_URL.rstrip('/')}/r/{sub}/search.json"
-            try:
-                response = ScraperService._request(
-                    url=endpoint,
-                    params={"q": query, "sort": "relevance", "t": "year", "limit": request_limit,
-                            "raw_json": 1, "restrict_sr": "on" if sub != "all" else "off"},
-                    expect_json=True,
-                )
-                children = (response.json().get("data")
-                            or {}).get("children") or []
-                for child in children:
-                    data = child.get("data") or {}
-                    post_id = str(data.get("id") or "")
-                    if post_id in seen_ids:
-                        continue
-
-                    title = ScraperService._clean_text(
-                        str(data.get("title") or ""))
-                    snippet = ScraperService._clean_text(
-                        str(data.get("selftext") or ""))
-                    if not title and not snippet:
-                        continue
-
-                    permalink = str(data.get("permalink") or "").strip()
-                    item_url = urljoin(
-                        "https://www.reddit.com", permalink) if permalink else str(data.get("url") or "")
-
-                    published_at = None
-                    created_utc = data.get("created_utc")
-                    if isinstance(created_utc, (int, float)):
-                        published_at = datetime.fromtimestamp(
-                            float(created_utc), tz=timezone.utc).isoformat()
-
-                    seen_ids.add(post_id)
-                    all_items.append({
-                        "id": post_id,
-                        "title": title,
-                        "snippet": snippet,
-                        "url": item_url,
-                        "author": ScraperService._clean_text(str(data.get("author") or "")) or None,
-                        "published_at": published_at,
-                        "raw": {
-                            "subreddit": data.get("subreddit"),
-                            "score": data.get("score"),
-                            "num_comments": data.get("num_comments"),
-                        },
-                    })
-                    if len(all_items) >= limit:
-                        break
-            except Exception:
-                continue
+        for search_query in search_queries:
             if len(all_items) >= limit:
                 break
 
+            for sub in subreddits:
+                if len(all_items) >= limit:
+                    break
+
+                endpoint = f"{settings.SCRAPER_REDDIT_URL.rstrip('/')}/r/{sub}/search.json"
+                params = {
+                    "q": search_query,
+                    "sort": "relevance",
+                    "t": time_filter,
+                    "limit": request_limit,
+                    "raw_json": 1,
+                    "restrict_sr": "on" if sub != "all" else "off",
+                }
+
+                try:
+                    response = ScraperService._request(
+                        url=endpoint,
+                        params=params,
+                        expect_json=True,
+                    )
+                    children = (response.json().get("data") or {}).get("children") or []
+
+                    for child in children:
+                        data = child.get("data") or {}
+                        post_id = str(data.get("id") or "").strip()
+                        if not post_id or post_id in seen_ids:
+                            continue
+
+                        title = ScraperService._clean_text(str(data.get("title") or ""))
+                        selftext = ScraperService._clean_text(str(data.get("selftext") or ""))
+                        subreddit = ScraperService._clean_text(str(data.get("subreddit") or sub))
+
+                        if not title and not selftext:
+                            continue
+
+                        # Mantém snippet curto para não poluir payload e LLM.
+                        snippet = selftext[:900] if selftext else ""
+                        permalink = str(data.get("permalink") or "").strip()
+                        item_url = urljoin("https://www.reddit.com", permalink) if permalink else str(data.get("url") or "")
+
+                        published_at = None
+                        created_utc = data.get("created_utc")
+                        if isinstance(created_utc, (int, float)):
+                            published_at = datetime.fromtimestamp(float(created_utc), tz=timezone.utc).isoformat()
+
+                        score = int(data.get("score") or 0)
+                        num_comments = int(data.get("num_comments") or 0)
+
+                        seen_ids.add(post_id)
+                        all_items.append({
+                            "id": post_id,
+                            "title": title,
+                            "snippet": snippet,
+                            "url": item_url,
+                            "author": ScraperService._clean_text(str(data.get("author") or "")) or None,
+                            "published_at": published_at,
+                            "raw": {
+                                "collector": "reddit_public_json",
+                                "subreddit": subreddit,
+                                "score": score,
+                                "num_comments": num_comments,
+                                "search_query": search_query,
+                            },
+                        })
+
+                        if len(all_items) >= limit:
+                            break
+                except Exception as exc:
+                    errors.append(f"r/{sub}: {exc}")
+                    continue
+
         if not all_items:
+            if errors:
+                return [], f"Reddit sem resultados ou indisponível: {errors[0]}"
             return [], "Reddit sem resultados relevantes"
-        return all_items, None
+
+        all_items.sort(
+            key=lambda item: (
+                int((item.get("raw") or {}).get("num_comments") or 0),
+                int((item.get("raw") or {}).get("score") or 0),
+            ),
+            reverse=True,
+        )
+        return all_items[:limit], None
 
     @staticmethod
     def _scrape_reclameaqui(query: str, limit: int) -> tuple[list[dict[str, Any]], str | None]:
@@ -573,18 +668,64 @@ class ScraperService:
 
     @staticmethod
     def _scrape_reclameaqui_via_web_search(query: str, limit: int) -> list[dict[str, Any]]:
-        """Fallback seguro para Render, sem DDGS.
+        """Fallback seguro para Render, sem DDGS, com múltiplas variações.
 
-        DDGS aciona Google/Brave/Startpage/Yahoo/Mojeek e costuma gerar 429,
-        captcha e timeout em ambiente cloud. Para produção, usamos somente
-        DuckDuckGo HTML e nunca deixamos esse fallback derrubar o fluxo.
+        Não usa Google/Brave/Startpage/DDGS. Usa apenas DuckDuckGo HTML.
+        Isso reduz bloqueios 429/captcha e amplia cobertura por variações.
         """
         seen_urls: set[str] = set()
-        return ScraperService._scrape_reclameaqui_via_duckduckgo_html(
-            query=query,
-            limit=limit,
-            seen_urls=seen_urls,
-        )
+        items: list[dict[str, Any]] = []
+        q = ScraperService._clean_text(query)
+
+        query_variants = [
+            f'site:reclameaqui.com.br/reclamacao "{q}"',
+            f'site:reclameaqui.com.br/reclamacao "{q}" reclamação',
+            f'site:reclameaqui.com.br/reclamacao "{q}" problema',
+            f'site:reclameaqui.com.br/reclamacao "{q}" atendimento',
+            f'site:reclameaqui.com.br/reclamacao "{q}" cobrança',
+            f'site:reclameaqui.com.br/reclamacao "{q}" suporte',
+            f'site:reclameaqui.com.br/reclamacao "{q}" reembolso',
+            f'site:reclameaqui.com.br/reclamacao "{q}" atraso',
+            f'site:reclameaqui.com.br/reclamacao "{q}" cancelamento',
+            f'site:reclameaqui.com.br/reclamacao "{q}" garantia',
+        ]
+
+        for search_query in query_variants:
+            raw_items = ScraperService._search_duckduckgo_html(
+                search_query=search_query,
+                limit=max(limit * 4, 20),
+            )
+
+            for result in raw_items:
+                url = canonicalize_url(str(result.get("url") or ""))
+                if not url or url in seen_urls:
+                    continue
+                if "reclameaqui.com.br" not in url.lower() or "/reclamacao/" not in url.lower():
+                    continue
+
+                title = ScraperService._clean_text(str(result.get("title") or ""))
+                snippet = ScraperService._clean_text(str(result.get("snippet") or ""))
+                if not title and not snippet:
+                    continue
+
+                seen_urls.add(url)
+                items.append({
+                    "id": url,
+                    "title": title or f"Reclamação sobre {query}",
+                    "snippet": snippet,
+                    "url": url,
+                    "author": "ReclameAqui",
+                    "published_at": None,
+                    "raw": {
+                        "collector": "duckduckgo_html_reclameaqui",
+                        "search_query": search_query,
+                    },
+                })
+
+                if len(items) >= limit:
+                    return items[:limit]
+
+        return items[:limit]
 
     @staticmethod
     def _search_duckduckgo_html(search_query: str, limit: int) -> list[dict[str, Any]]:
@@ -891,48 +1032,78 @@ class ScraperService:
 
     @staticmethod
     def _scrape_web(query: str, limit: int) -> tuple[list[dict[str, Any]], str | None]:
-        """Busca web segura para Render, sem DDGS.
+        """Busca web segura para Render, sem DDGS, com múltiplas variações.
 
-        Usa apenas DuckDuckGo HTML. Não chama Google/Brave/Startpage/Yahoo/Mojeek,
-        reduzindo bloqueios 429/captcha e evitando que a rota /api/search trave.
+        Estratégia:
+        - Usa DuckDuckGo HTML direto.
+        - Não chama Google/Brave/Startpage/Yahoo/Mojeek.
+        - Faz dedupe por URL.
+        - Dá preferência a resultados com linguagem de reputação/experiência.
         """
         items: list[dict[str, Any]] = []
         seen_urls: set[str] = set()
+        q = ScraperService._clean_text(query)
 
-        search_query = (
-            f'"{query}" '
-            f'(avaliação OR reclamação OR opinião OR review OR problema OR defeito '
-            f'OR atraso OR suporte OR atendimento OR "não recomendo")'
-        )
+        search_queries = [
+            f'"{q}" reclamação',
+            f'"{q}" problema',
+            f'"{q}" atendimento',
+            f'"{q}" suporte',
+            f'"{q}" avaliação',
+            f'"{q}" opinião',
+            f'"{q}" review',
+            f'"{q}" experiência',
+            f'"{q}" cobrança',
+            f'"{q}" reembolso',
+            f'"{q}" atraso',
+            f'"{q}" cancelamento',
+            f'"{q}" garantia',
+            f'"{q}" não recomendo',
+        ]
 
-        raw_items = ScraperService._search_duckduckgo_html(
-            search_query=search_query,
-            limit=max(limit * 2, limit),
-        )
+        # Domínios que costumam gerar pouco valor para análise reputacional.
+        blocked_domains = {
+            "facebook.com", "instagram.com", "linkedin.com", "pinterest.com",
+            "youtube.com", "tiktok.com", "x.com", "twitter.com",
+            "google.com", "duckduckgo.com",
+        }
 
-        for result in raw_items:
-            url = canonicalize_url(str(result.get("url") or ""))
-            if not url or url in seen_urls:
-                continue
+        for search_query in search_queries:
+            raw_items = ScraperService._search_duckduckgo_html(
+                search_query=search_query,
+                limit=max(limit * 3, 15),
+            )
 
-            title = ScraperService._clean_text(str(result.get("title") or ""))
-            snippet = ScraperService._clean_text(str(result.get("snippet") or ""))
-            if not title and not snippet:
-                continue
+            for result in raw_items:
+                url = canonicalize_url(str(result.get("url") or ""))
+                if not url or url in seen_urls:
+                    continue
 
-            seen_urls.add(url)
-            items.append({
-                "id": url,
-                "title": title or f"Resultado sobre {query}",
-                "snippet": snippet,
-                "url": url,
-                "author": urlparse(url).netloc,
-                "published_at": None,
-                "raw": {"collector": "duckduckgo_html_safe", "search_query": search_query},
-            })
+                domain = urlparse(url).netloc.lower().replace("www.", "")
+                if any(domain.endswith(blocked) for blocked in blocked_domains):
+                    continue
 
-            if len(items) >= limit:
-                break
+                title = ScraperService._clean_text(str(result.get("title") or ""))
+                snippet = ScraperService._clean_text(str(result.get("snippet") or ""))
+                if not title and not snippet:
+                    continue
+
+                seen_urls.add(url)
+                items.append({
+                    "id": url,
+                    "title": title or f"Resultado sobre {query}",
+                    "snippet": snippet,
+                    "url": url,
+                    "author": domain,
+                    "published_at": None,
+                    "raw": {
+                        "collector": "duckduckgo_html_safe",
+                        "search_query": search_query,
+                    },
+                })
+
+                if len(items) >= limit:
+                    return items[:limit], None
 
         if not items:
             return [], "Busca web sem resultados utilizáveis ou bloqueada pela fonte externa"
@@ -1001,11 +1172,16 @@ class ScraperService:
         if not href:
             return ""
 
+        href = str(href).strip()
+        if href.startswith("//"):
+            href = f"https:{href}"
+
+        parsed = urlparse(href)
+        params = parse_qs(parsed.query)
+        if "uddg" in params and params["uddg"]:
+            return unquote(params["uddg"][0])
+
         if href.startswith("/"):
-            parsed = urlparse(href)
-            params = parse_qs(parsed.query)
-            if "uddg" in params and params["uddg"]:
-                return unquote(params["uddg"][0])
             return urljoin("https://duckduckgo.com", href)
 
         return href
@@ -1048,7 +1224,8 @@ class ScraperService:
 
             quality_score = ScraperService._quality_score(
                 text, title=title, snippet=snippet)
-            if quality_score < 0.25:
+            min_quality_score = float(getattr(settings, "SCRAPER_MIN_QUALITY_SCORE", 0.10))
+            if quality_score < min_quality_score:
                 continue
 
             seen_keys.add(dedupe_key)

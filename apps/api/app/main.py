@@ -168,8 +168,12 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 @app.get("/")
 async def root():
-    """Rota raiz para healthcheck do Render e acesso direto pelo navegador."""
     return {"ok": True, "service": "SentimentoIA API", "version": "2.0.0"}
+
+
+@app.head("/")
+async def root_head():
+    return JSONResponse(content={})
 
 
 @app.get("/health")
@@ -213,9 +217,18 @@ async def search_mentions(payload: SearchRequest, current_user: dict[str, Any] =
     - replace_existing=True força nova busca.
     - replace_existing=False permite cache inteligente por CACHE_TTL_MINUTES.
     """
-    sources = [getattr(source, "value", str(source))
-               for source in payload.sources]
+    sources = [getattr(source, "value", str(source)) for source in payload.sources]
+    if not sources:
+        sources = SourceRegistryService.default_sources()
+
     user_id = str(current_user.get("_id") or current_user.get("id"))
+    logger.info(
+        "Busca recebida brand=%s sources=%s period_days=%s replace_existing=%s",
+        payload.brand_name,
+        sources,
+        payload.period_days,
+        payload.replace_existing,
+    )
 
     try:
         result = await asyncio.wait_for(
@@ -227,12 +240,12 @@ async def search_mentions(payload: SearchRequest, current_user: dict[str, Any] =
                 locality=payload.locality,
                 use_cache=not payload.replace_existing,
             ),
-            timeout=float(getattr(settings, "SEARCH_TIMEOUT_SECONDS", 55)),
+            timeout=max(10, int(getattr(settings, "SEARCH_TIMEOUT_SECONDS", 55))),
         )
     except asyncio.TimeoutError as exc:
         raise HTTPException(
             status_code=504,
-            detail="A busca excedeu o tempo limite. Reduza as fontes ou tente novamente.",
+            detail="A busca demorou demais. Reduza fontes ou tente novamente com outro termo.",
         ) from exc
 
     return result
