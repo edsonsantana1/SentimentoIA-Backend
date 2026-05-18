@@ -3,6 +3,7 @@ import logging
 import re
 import sys
 import time
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
@@ -108,7 +109,10 @@ class ScraperService:
             "consumidor": ScraperService._scrape_consumidor,
         }
 
-        worker_count = min(max(1, len(normalized_sources)), 4)
+        # Em produção/Render, rodar muitas fontes em paralelo aumenta bloqueios 429/captcha.
+        # Use SCRAPER_MAX_WORKERS=1 ou 2 no ambiente se quiser controlar.
+        max_workers_setting = max(1, int(getattr(settings, "SCRAPER_MAX_WORKERS", 1)))
+        worker_count = min(max(1, len(normalized_sources)), max_workers_setting)
         with ThreadPoolExecutor(max_workers=worker_count) as pool:
             future_map = {
                 pool.submit(ScraperService._run_source_pipeline, source, term, limit, handlers, user_id, relevance_threshold): source
@@ -638,80 +642,123 @@ class ScraperService:
         return items[:limit]
 
     @staticmethod
-    def _scrape_reclameaqui_via_duckduckgo_html(
-        query: str,
-        limit: int,
-        seen_urls: set[str],
-    ) -> list[dict[str, Any]]:
+    def _search_duckduckgo_html(search_query: str, limit: int) -> list[dict[str, Any]]:
+        """Busca leve no DuckDuckGo HTML e decodifica redirects com uddg.
+
+        Motivo: em Render, DDGS costuma chamar vários motores externos e gerar 429/captcha.
+        Este fallback usa apenas o endpoint HTML do DuckDuckGo e nunca lança exceção para o fluxo principal.
+        """
         items: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+
+        if limit <= 0:
+            return items
+
+        headers = {
+            "User-Agent": settings.SCRAPER_USER_AGENT.strip() or (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
+
         try:
-            search_query = (
-                f'site:reclameaqui.com.br/reclamacao "{query}" '
-                f'(reclamação OR problema OR atendimento OR suporte OR entrega OR cobrança)'
-            )
-            headers = {
-                "User-Agent": settings.SCRAPER_USER_AGENT.strip() or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-            }
             response = requests.post(
                 "https://html.duckduckgo.com/html/",
                 data={"q": search_query},
                 headers=headers,
                 timeout=max(5, int(settings.SCRAPER_TIMEOUT_SECONDS)),
             )
-            if response.status_code >= 400:
-                raise RuntimeError(
-                    f"DuckDuckGo HTML search HTTP {response.status_code}"
-                )
+            if response.status_code not in {200, 202}:
+                logger.warning("DuckDuckGo HTML retornou HTTP %s", response.status_code)
+                return items
 
             soup = BeautifulSoup(response.text, "html.parser")
-            for link_node in soup.select("a[href*='/reclamacao/']"):
+            result_links = soup.select("a.result__a, a[href]")
+
+            for link_node in result_links:
                 href = str(link_node.get("href") or "").strip()
                 if not href:
                     continue
 
-                item_url = canonicalize_url(
-                    urljoin("https://www.reclameaqui.com.br", href))
-                if not item_url or item_url in seen_urls:
+                target = ScraperService._extract_web_target(href)
+                url = canonicalize_url(target)
+                if not url or url in seen_urls:
                     continue
 
-                title = ScraperService._clean_text(
-                    link_node.get_text(" ", strip=True))
+                title = ScraperService._clean_text(link_node.get_text(" ", strip=True))
                 if not title:
                     continue
 
                 snippet = ""
-                container = link_node.find_parent(
-                    ["article", "li", "div", "section"])
+                container = link_node.find_parent(["article", "li", "div", "section"])
                 if container is not None:
-                    for snippet_node in container.select("p, span"):
-                        text = ScraperService._clean_text(
-                            snippet_node.get_text(" ", strip=True))
-                        if text and text != title and len(text) >= 20:
-                            snippet = text
-                            break
+                    snippet_node = container.select_one(".result__snippet, .result__body, p, span")
+                    if snippet_node is not None:
+                        snippet = ScraperService._clean_text(
+                            snippet_node.get_text(" ", strip=True)
+                        )
 
-                seen_urls.add(item_url)
-                items.append(
-                    {
-                        "id": item_url,
-                        "title": title,
-                        "snippet": snippet,
-                        "url": item_url,
-                        "author": "ReclameAqui",
-                        "published_at": None,
-                        "raw": {"collector": "duckduckgo_html_reclameaqui"},
-                    }
-                )
+                seen_urls.add(url)
+                items.append({
+                    "id": url,
+                    "title": title,
+                    "snippet": snippet,
+                    "url": url,
+                    "author": urlparse(url).netloc,
+                    "published_at": None,
+                    "raw": {"collector": "duckduckgo_html", "search_query": search_query},
+                })
+
                 if len(items) >= limit:
                     break
-
         except Exception as exc:
-            logger.warning(
-                "Fallback ReclameAqui via DuckDuckGo HTML falhou: %s", exc)
+            logger.warning("DuckDuckGo HTML falhou: %s", exc)
 
         return items[:limit]
+
+    @staticmethod
+    def _scrape_reclameaqui_via_duckduckgo_html(
+        query: str,
+        limit: int,
+        seen_urls: set[str],
+    ) -> list[dict[str, Any]]:
+        search_query = (
+            f'site:reclameaqui.com.br/reclamacao "{query}" '
+            f'(reclamação OR problema OR atendimento OR suporte OR entrega OR cobrança)'
+        )
+
+        raw_items = ScraperService._search_duckduckgo_html(
+            search_query=search_query,
+            limit=max(limit * 3, limit),
+        )
+
+        items: list[dict[str, Any]] = []
+        for result in raw_items:
+            url = canonicalize_url(str(result.get("url") or ""))
+            if not url or url in seen_urls:
+                continue
+            if "reclameaqui.com.br" not in url.lower() or "/reclamacao/" not in url.lower():
+                continue
+
+            seen_urls.add(url)
+            items.append({
+                "id": url,
+                "title": ScraperService._clean_text(str(result.get("title") or "")) or f"Reclamação sobre {query}",
+                "snippet": ScraperService._clean_text(str(result.get("snippet") or "")),
+                "url": url,
+                "author": "ReclameAqui",
+                "published_at": None,
+                "raw": {"collector": "duckduckgo_html_reclameaqui"},
+            })
+
+            if len(items) >= limit:
+                break
+
+        return items[:limit]
+
 
     @staticmethod
     def _scrape_reclameaqui_browser_fallback(
@@ -899,131 +946,117 @@ class ScraperService:
 
     @staticmethod
     def _scrape_web(query: str, limit: int) -> tuple[list[dict[str, Any]], str | None]:
-        """Busca web aberta com DDGS e enriquecimento leve dos primeiros links."""
+        """Busca web aberta com fallback tolerante a bloqueios.
+
+        Em Render, DDGS pode acionar Google/Brave/Startpage/Yahoo e gerar 429/captcha.
+        Por isso a ordem correta é: DuckDuckGo HTML primeiro, DDGS apenas se necessário.
+        """
         items: list[dict[str, Any]] = []
         seen_urls: set[str] = set()
 
-        try:
-            search_query = (
-                f'"{query}" '
-                f'(avaliação OR reclamação OR opinião OR review OR problema OR defeito '
-                f'OR atraso OR suporte OR atendimento OR "não recomendo")'
-            )
+        search_query = (
+            f'"{query}" '
+            f'(avaliação OR reclamação OR opinião OR review OR problema OR defeito '
+            f'OR atraso OR suporte OR atendimento OR "não recomendo")'
+        )
 
+        # 1) Primeiro usa um caminho mais estável para ambiente cloud.
+        for result in ScraperService._search_duckduckgo_html(
+            search_query=search_query,
+            limit=max(limit * 2, limit),
+        ):
+            url = canonicalize_url(str(result.get("url") or ""))
+            if not url or url in seen_urls:
+                continue
+
+            title = ScraperService._clean_text(str(result.get("title") or ""))
+            snippet = ScraperService._clean_text(str(result.get("snippet") or ""))
+            if not title and not snippet:
+                continue
+
+            seen_urls.add(url)
+            items.append({
+                "id": url,
+                "title": title,
+                "snippet": snippet,
+                "url": url,
+                "author": urlparse(url).netloc,
+                "published_at": None,
+                "raw": {"collector": "duckduckgo_html", "search_query": search_query},
+            })
+            if len(items) >= limit:
+                break
+
+        # 2) DDGS fica como fallback, não como caminho principal.
+        if len(items) < limit:
             try:
                 from ddgs import DDGS
 
                 with DDGS() as ddgs:
-                    results = list(
-                        ddgs.text(search_query, max_results=max(limit * 3, limit)))
+                    results = list(ddgs.text(search_query, max_results=limit - len(items)))
 
                 for result in results:
                     url = canonicalize_url(str(result.get("href") or ""))
                     if not url or url in seen_urls:
                         continue
 
-                    title = ScraperService._clean_text(
-                        str(result.get("title") or ""))
-                    snippet = ScraperService._clean_text(
-                        str(result.get("body") or ""))
+                    title = ScraperService._clean_text(str(result.get("title") or ""))
+                    snippet = ScraperService._clean_text(str(result.get("body") or ""))
                     if not title and not snippet:
                         continue
 
                     seen_urls.add(url)
-                    items.append(
-                        {
-                            "id": url,
-                            "title": title,
-                            "snippet": snippet,
-                            "url": url,
-                            "author": urlparse(url).netloc,
-                            "published_at": None,
-                            "raw": {"collector": "ddgs", "search_query": search_query},
-                        }
-                    )
-                    if len(items) >= limit * 2:
+                    items.append({
+                        "id": url,
+                        "title": title,
+                        "snippet": snippet,
+                        "url": url,
+                        "author": urlparse(url).netloc,
+                        "published_at": None,
+                        "raw": {"collector": "ddgs_fallback", "search_query": search_query},
+                    })
+                    if len(items) >= limit:
                         break
-
             except Exception as exc:
-                logger.warning("DDGS falhou, usando fallback HTML. %s", exc)
+                logger.warning("DDGS indisponível/bloqueado no Render: %s", exc)
 
-                response = ScraperService._request(
-                    url=settings.SCRAPER_WEB_SEARCH_URL.rstrip("/"),
-                    params={"q": search_query},
-                )
-                soup = BeautifulSoup(response.text, "html.parser")
+        # 3) Enriquecimento leve. Não deve derrubar a busca se falhar.
+        try:
+            import trafilatura
+        except ImportError:
+            trafilatura = None
 
-                for container in soup.select("div.result, article, li"):
-                    link_node = container.select_one(
-                        "a.result__a, h2 a, a[data-testid='result-title-a'], a[href]"
-                    )
-                    if not link_node:
-                        continue
-
-                    target = ScraperService._extract_web_target(
-                        str(link_node.get("href") or "").strip()
-                    )
-                    url = canonicalize_url(target)
-                    if not url or url in seen_urls:
-                        continue
-
-                    title = ScraperService._clean_text(
-                        link_node.get_text(" ", strip=True))
-                    if not title:
-                        continue
-
-                    seen_urls.add(url)
-                    items.append(
-                        {
-                            "id": url,
-                            "title": title,
-                            "snippet": "",
-                            "url": url,
-                            "author": urlparse(url).netloc,
-                            "published_at": None,
-                            "raw": {"collector": "duckduckgo_html_fallback"},
-                        }
-                    )
-                    if len(items) >= limit * 2:
-                        break
-
-            # Enriquecimento leve: acessa poucos links para melhorar snippet.
-            # Isso aumenta qualidade dos insights, mas sem transformar o scraper em crawler pesado.
+        enrichment_limit = min(2, len(items))
+        for item in items[:enrichment_limit]:
             try:
-                import trafilatura
-            except ImportError:
-                trafilatura = None
-
-            enrichment_limit = min(5, len(items))
-            for item in items[:enrichment_limit]:
-                try:
-                    headers = {
-                        "User-Agent": settings.SCRAPER_USER_AGENT.strip(),
-                        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-                    }
-                    response = requests.get(
-                        item["url"], headers=headers, timeout=10)
-                    if response.status_code >= 400:
-                        continue
-
-                    if trafilatura:
-                        text = trafilatura.extract(response.text)
-                        if text:
-                            item["snippet"] = ScraperService._clean_text(text)[
-                                :1000]
-                    else:
-                        soup = BeautifulSoup(response.text, "html.parser")
-                        page_text = soup.get_text(" ", strip=True)
-                        if page_text:
-                            item["snippet"] = ScraperService._clean_text(page_text)[
-                                :1000]
-                except Exception:
+                headers = {
+                    "User-Agent": settings.SCRAPER_USER_AGENT.strip() or (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+                }
+                response = requests.get(item["url"], headers=headers, timeout=8)
+                if response.status_code >= 400:
                     continue
 
-            return items[:limit], None
+                if trafilatura:
+                    text = trafilatura.extract(response.text)
+                    if text:
+                        item["snippet"] = ScraperService._clean_text(text)[:1000]
+                else:
+                    soup = BeautifulSoup(response.text, "html.parser")
+                    page_text = soup.get_text(" ", strip=True)
+                    if page_text:
+                        item["snippet"] = ScraperService._clean_text(page_text)[:1000]
+            except Exception:
+                continue
 
-        except Exception as exc:
-            return [], f"Falha na busca Web: {exc}"
+        if not items:
+            return [], "Busca web sem resultados ou bloqueada pelos provedores externos"
+
+        return items[:limit], None
+
 
     @staticmethod
     def _scrape_trustpilot(query: str, limit: int) -> tuple[list[dict[str, Any]], str | None]:
@@ -1372,20 +1405,31 @@ class ScraperService:
 
         timeout = max(5, int(settings.SCRAPER_TIMEOUT_SECONDS))
         attempts = max(1, int(settings.SCRAPER_RETRY_ATTEMPTS))
-        base_delay = max(0.1, float(settings.SCRAPER_DELAY_SECONDS))
-        retry_backoff = max(0.2, float(settings.SCRAPER_RETRY_BACKOFF_SECONDS))
+        base_delay = max(0.3, float(settings.SCRAPER_DELAY_SECONDS))
+        retry_backoff = max(0.5, float(settings.SCRAPER_RETRY_BACKOFF_SECONDS))
 
         last_error: Exception | None = None
+        retryable_status = {408, 425, 429, 500, 502, 503, 504}
+
         for attempt in range(1, attempts + 1):
             try:
-                response = requests.get(
-                    url, params=params, headers=headers, timeout=timeout)
-                if response.status_code in {429, 500, 502, 503, 504}:
-                    raise RuntimeError(
-                        f"HTTP {response.status_code} em {response.url}")
+                response = requests.get(url, params=params, headers=headers, timeout=timeout)
+
+                if response.status_code in retryable_status:
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after and retry_after.isdigit():
+                        sleep_seconds = min(15.0, float(retry_after))
+                    else:
+                        sleep_seconds = base_delay + ((attempt - 1) * retry_backoff) + random.uniform(0.2, 1.2)
+
+                    last_error = RuntimeError(f"HTTP {response.status_code} em {response.url}")
+                    if attempt < attempts:
+                        time.sleep(sleep_seconds)
+                        continue
+                    raise last_error
+
                 if response.status_code >= 400:
-                    raise RuntimeError(
-                        f"HTTP {response.status_code} em {response.url}")
+                    raise RuntimeError(f"HTTP {response.status_code} em {response.url}")
 
                 if expect_json:
                     response.json()
@@ -1394,10 +1438,10 @@ class ScraperService:
                 last_error = exc
                 if attempt >= attempts:
                     break
-                time.sleep(base_delay + ((attempt - 1) * retry_backoff))
+                time.sleep(base_delay + ((attempt - 1) * retry_backoff) + random.uniform(0.2, 1.2))
 
-        raise RuntimeError(
-            str(last_error) if last_error else "Falha de rede desconhecida")
+        raise RuntimeError(str(last_error) if last_error else "Falha de rede desconhecida")
+
 
     @staticmethod
     def _clean_text(value: str) -> str:
