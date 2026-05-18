@@ -166,6 +166,12 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
+@app.get("/")
+async def root():
+    """Rota raiz para healthcheck do Render e acesso direto pelo navegador."""
+    return {"ok": True, "service": "SentimentoIA API", "version": "2.0.0"}
+
+
 @app.get("/health")
 async def health():
     """Healthcheck simples para saber se o backend está ativo."""
@@ -211,14 +217,24 @@ async def search_mentions(payload: SearchRequest, current_user: dict[str, Any] =
                for source in payload.sources]
     user_id = str(current_user.get("_id") or current_user.get("id"))
 
-    result = await SearchService.run_search(
-        user_id=user_id,
-        query=payload.brand_name,
-        sources=sources,
-        period_days=payload.period_days,
-        locality=payload.locality,
-        use_cache=not payload.replace_existing,
-    )
+    try:
+        result = await asyncio.wait_for(
+            SearchService.run_search(
+                user_id=user_id,
+                query=payload.brand_name,
+                sources=sources,
+                period_days=payload.period_days,
+                locality=payload.locality,
+                use_cache=not payload.replace_existing,
+            ),
+            timeout=float(getattr(settings, "SEARCH_TIMEOUT_SECONDS", 55)),
+        )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="A busca excedeu o tempo limite. Reduza as fontes ou tente novamente.",
+        ) from exc
+
     return result
 
 
