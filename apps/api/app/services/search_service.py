@@ -466,6 +466,49 @@ class SearchService:
         return signatures
 
     @staticmethod
+    def _find_existing_mention_by_signature(
+        *,
+        db,
+        user_id: str,
+        signature: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Busca uma menção já existente pela assinatura de deduplicação.
+
+        Esse método evita o erro AttributeError no run_search e permite que
+        buscas repetidas reaproveitem menções já salvas no MongoDB sem duplicar
+        a coleta original.
+        """
+        if db is None:
+            return None
+
+        if not signature:
+            return None
+
+        or_filters: list[dict[str, Any]] = []
+
+        for key in (
+            "external_id",
+            "text_fingerprint",
+            "content_hash",
+            "canonical_url",
+        ):
+            value = str(signature.get(key) or "").strip()
+            if value:
+                or_filters.append({key: value})
+
+        if not or_filters:
+            return None
+
+        return db.mentions.find_one(
+            {
+                "user_id": user_id,
+                "$or": or_filters,
+            },
+            {"raw": 0},
+            sort=[("created_at", -1)],
+        )
+
+    @staticmethod
     def _mention_signature(mention: dict[str, Any]) -> dict[str, str]:
         source = str(mention.get("source") or "").strip().lower()
         author = str(mention.get("author") or "").strip().lower()
