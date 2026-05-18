@@ -668,33 +668,39 @@ class ScraperService:
 
     @staticmethod
     def _scrape_reclameaqui_via_web_search(query: str, limit: int) -> list[dict[str, Any]]:
-        """Fallback seguro para Render, sem DDGS, com múltiplas variações.
+        """Fallback do ReclameAqui via DuckDuckGo HTML, com circuit breaker.
 
-        Não usa Google/Brave/Startpage/DDGS. Usa apenas DuckDuckGo HTML.
-        Isso reduz bloqueios 429/captcha e amplia cobertura por variações.
+        Importante para Render:
+        - Não usa DDGS, Google, Brave, Startpage, Yahoo ou Mojeek.
+        - Usa poucas queries.
+        - Se DuckDuckGo estiver indisponível, falha rápido e não insiste.
         """
-        seen_urls: set[str] = set()
-        items: list[dict[str, Any]] = []
-        q = ScraperService._clean_text(query)
+        if not bool(getattr(settings, "SCRAPER_WEB_ENABLED", True)):
+            return []
 
+        q = ScraperService._clean_text(query)
+        if not q:
+            return []
+
+        max_queries = max(1, min(2, int(getattr(settings, "SCRAPER_DDG_MAX_QUERIES", 1))))
         query_variants = [
             f'site:reclameaqui.com.br/reclamacao "{q}"',
-            f'site:reclameaqui.com.br/reclamacao "{q}" reclamação',
-            f'site:reclameaqui.com.br/reclamacao "{q}" problema',
-            f'site:reclameaqui.com.br/reclamacao "{q}" atendimento',
-            f'site:reclameaqui.com.br/reclamacao "{q}" cobrança',
-            f'site:reclameaqui.com.br/reclamacao "{q}" suporte',
-            f'site:reclameaqui.com.br/reclamacao "{q}" reembolso',
-            f'site:reclameaqui.com.br/reclamacao "{q}" atraso',
-            f'site:reclameaqui.com.br/reclamacao "{q}" cancelamento',
-            f'site:reclameaqui.com.br/reclamacao "{q}" garantia',
-        ]
+            f'site:reclameaqui.com.br/reclamacao "{q}" reclamação problema atendimento',
+        ][:max_queries]
 
-        for search_query in query_variants:
+        seen_urls: set[str] = set()
+        items: list[dict[str, Any]] = []
+
+        for index, search_query in enumerate(query_variants):
             raw_items = ScraperService._search_duckduckgo_html(
                 search_query=search_query,
-                limit=max(limit * 4, 20),
+                limit=max(limit, 6),
             )
+
+            # Circuit breaker local: se a primeira tentativa falhar, não fica
+            # multiplicando timeouts no Render.
+            if not raw_items and index == 0:
+                return []
 
             for result in raw_items:
                 url = canonicalize_url(str(result.get("url") or ""))
@@ -729,16 +735,29 @@ class ScraperService:
 
     @staticmethod
     def _search_duckduckgo_html(search_query: str, limit: int) -> list[dict[str, Any]]:
-        """Busca leve no DuckDuckGo HTML e decodifica redirects com uddg.
+        """Busca leve no DuckDuckGo HTML com falha rápida e circuit breaker.
 
-        Motivo: em Render, DDGS costuma chamar vários motores externos e gerar 429/captcha.
-        Este fallback usa apenas o endpoint HTML do DuckDuckGo e nunca lança exceção para o fluxo principal.
+        No Render, html.duckduckgo.com frequentemente dá connect timeout.
+        Por isso esta função:
+        - usa timeout curto próprio;
+        - não lança exceção para o pipeline;
+        - desativa temporariamente novas tentativas após falhas repetidas.
         """
         items: list[dict[str, Any]] = []
         seen_urls: set[str] = set()
 
         if limit <= 0:
             return items
+
+        now_ts = time.time()
+        disabled_until = float(getattr(ScraperService, "_DDG_DISABLED_UNTIL", 0.0))
+        if disabled_until > now_ts:
+            logger.info(
+                "DuckDuckGo HTML ignorado por circuit breaker por %.1fs. query=%s",
+                disabled_until - now_ts,
+                search_query,
+            )
+            return []
 
         headers = {
             "User-Agent": settings.SCRAPER_USER_AGENT.strip() or (
@@ -750,21 +769,30 @@ class ScraperService:
             "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
         }
 
+        timeout = max(2, min(4, int(getattr(settings, "SCRAPER_DDG_TIMEOUT_SECONDS", 3))))
+
         try:
             response = requests.post(
                 "https://html.duckduckgo.com/html/",
                 data={"q": search_query},
                 headers=headers,
-                timeout=max(5, int(settings.SCRAPER_TIMEOUT_SECONDS)),
+                timeout=timeout,
             )
+
+            # Sucesso: zera contador de falhas do circuit breaker.
+            setattr(ScraperService, "_DDG_FAILURES", 0)
+
             if response.status_code not in {200, 202}:
-                logger.warning("DuckDuckGo HTML retornou HTTP %s", response.status_code)
-                return items
+                logger.warning(
+                    "DuckDuckGo HTML retornou HTTP %s. query=%s",
+                    response.status_code,
+                    search_query,
+                )
+                return []
 
             soup = BeautifulSoup(response.text, "html.parser")
-            result_links = soup.select("a.result__a, a[href]")
 
-            for link_node in result_links:
+            for link_node in soup.select("a.result__a, a[href]"):
                 href = str(link_node.get("href") or "").strip()
                 if not href:
                     continue
@@ -795,13 +823,33 @@ class ScraperService:
                     "url": url,
                     "author": urlparse(url).netloc,
                     "published_at": None,
-                    "raw": {"collector": "duckduckgo_html", "search_query": search_query},
+                    "raw": {
+                        "collector": "duckduckgo_html",
+                        "search_query": search_query,
+                    },
                 })
 
                 if len(items) >= limit:
                     break
+
+        except (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout) as exc:
+            failures = int(getattr(ScraperService, "_DDG_FAILURES", 0)) + 1
+            setattr(ScraperService, "_DDG_FAILURES", failures)
+
+            if failures >= 2:
+                cooldown = int(getattr(settings, "SCRAPER_DDG_CIRCUIT_BREAKER_SECONDS", 180))
+                setattr(ScraperService, "_DDG_DISABLED_UNTIL", time.time() + cooldown)
+                logger.warning(
+                    "DuckDuckGo HTML indisponível. Circuit breaker ativo por %ss. Última query=%s",
+                    cooldown,
+                    search_query,
+                )
+            else:
+                logger.warning("DuckDuckGo HTML timeout rápido. query=%s erro=%s", search_query, exc)
+            return []
         except Exception as exc:
             logger.warning("DuckDuckGo HTML falhou: %s", exc)
+            return []
 
         return items[:limit]
 
@@ -811,40 +859,14 @@ class ScraperService:
         limit: int,
         seen_urls: set[str],
     ) -> list[dict[str, Any]]:
-        search_query = (
-            f'site:reclameaqui.com.br/reclamacao "{query}" '
-            f'(reclamação OR problema OR atendimento OR suporte OR entrega OR cobrança)'
+        """Compatibilidade: usa o fallback novo com limite seguro."""
+        if not bool(getattr(settings, "SCRAPER_WEB_ENABLED", True)):
+            return []
+
+        return ScraperService._scrape_reclameaqui_via_web_search(
+            query=query,
+            limit=limit,
         )
-
-        raw_items = ScraperService._search_duckduckgo_html(
-            search_query=search_query,
-            limit=max(limit * 3, limit),
-        )
-
-        items: list[dict[str, Any]] = []
-        for result in raw_items:
-            url = canonicalize_url(str(result.get("url") or ""))
-            if not url or url in seen_urls:
-                continue
-            if "reclameaqui.com.br" not in url.lower() or "/reclamacao/" not in url.lower():
-                continue
-
-            seen_urls.add(url)
-            items.append({
-                "id": url,
-                "title": ScraperService._clean_text(str(result.get("title") or "")) or f"Reclamação sobre {query}",
-                "snippet": ScraperService._clean_text(str(result.get("snippet") or "")),
-                "url": url,
-                "author": "ReclameAqui",
-                "published_at": None,
-                "raw": {"collector": "duckduckgo_html_reclameaqui"},
-            })
-
-            if len(items) >= limit:
-                break
-
-        return items[:limit]
-
 
     @staticmethod
     def _scrape_reclameaqui_browser_fallback(
@@ -1032,47 +1054,45 @@ class ScraperService:
 
     @staticmethod
     def _scrape_web(query: str, limit: int) -> tuple[list[dict[str, Any]], str | None]:
-        """Busca web segura para Render, sem DDGS, com múltiplas variações.
+        """Busca web segura para Render, sem DDGS.
 
         Estratégia:
-        - Usa DuckDuckGo HTML direto.
+        - Respeita SCRAPER_WEB_ENABLED.
+        - Usa poucas consultas no DuckDuckGo HTML.
+        - Se DuckDuckGo falhar na primeira consulta, para imediatamente.
         - Não chama Google/Brave/Startpage/Yahoo/Mojeek.
-        - Faz dedupe por URL.
-        - Dá preferência a resultados com linguagem de reputação/experiência.
         """
+        if not bool(getattr(settings, "SCRAPER_WEB_ENABLED", True)):
+            return [], "Fonte web desativada por configuração"
+
         items: list[dict[str, Any]] = []
         seen_urls: set[str] = set()
         q = ScraperService._clean_text(query)
+        if not q:
+            return [], "Termo de busca vazio"
 
+        max_queries = max(1, min(2, int(getattr(settings, "SCRAPER_DDG_MAX_QUERIES", 1))))
         search_queries = [
-            f'"{q}" reclamação',
-            f'"{q}" problema',
-            f'"{q}" atendimento',
-            f'"{q}" suporte',
-            f'"{q}" avaliação',
-            f'"{q}" opinião',
-            f'"{q}" review',
-            f'"{q}" experiência',
-            f'"{q}" cobrança',
-            f'"{q}" reembolso',
-            f'"{q}" atraso',
-            f'"{q}" cancelamento',
-            f'"{q}" garantia',
-            f'"{q}" não recomendo',
-        ]
+            f'"{q}" reclamação problema atendimento',
+            f'"{q}" avaliação opinião suporte',
+        ][:max_queries]
 
-        # Domínios que costumam gerar pouco valor para análise reputacional.
         blocked_domains = {
             "facebook.com", "instagram.com", "linkedin.com", "pinterest.com",
             "youtube.com", "tiktok.com", "x.com", "twitter.com",
             "google.com", "duckduckgo.com",
         }
 
-        for search_query in search_queries:
+        for index, search_query in enumerate(search_queries):
             raw_items = ScraperService._search_duckduckgo_html(
                 search_query=search_query,
-                limit=max(limit * 3, 15),
+                limit=max(limit, 6),
             )
+
+            # Se a primeira consulta nem respondeu, a Web está instável no Render.
+            # Não insistir evita cascata de timeouts.
+            if not raw_items and index == 0:
+                return [], "Busca web externa indisponível no momento"
 
             for result in raw_items:
                 url = canonicalize_url(str(result.get("url") or ""))
